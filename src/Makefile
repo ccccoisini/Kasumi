@@ -5,7 +5,7 @@ KDIR ?= /lib/modules/$(shell uname -r)/build
 MDIR := $(realpath $(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 
 obj-m += hymofs_lkm.o
-hymofs_lkm-objs := hymofs_core.o hymofs_tracepoint.o hymofs_ftrace.o
+hymofs_lkm-objs := hymofs_core.o hymofs_tracepoint.o hymofs_ftrace.o hymofs_uname.o hymofs_iop_override.o
 
 ccflags-y += -gz=none
 # Do not force CONFIG_DYNAMIC_FTRACE / CONFIG_FUNCTION_TRACER from module flags.

@@ -54,8 +54,10 @@
 #endif
 #include <asm/unistd.h>
 #include "hymofs_lkm.h"
+#include "hymofs_iop_override.h"
 #include "hymofs_ftrace.h"
 #include "hymofs_tracepoint.h"
+#include "hymofs_uname.h"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Anatdx");
@@ -214,6 +216,38 @@ static DEFINE_HASHTABLE(hymo_inject_dirs, HYMO_HASH_BITS);
 static DEFINE_HASHTABLE(hymo_xattr_sbs, HYMO_HASH_BITS);
 static DEFINE_HASHTABLE(hymo_merge_dirs, HYMO_HASH_BITS);
 
+/* ------------------------------------------------------------------ */
+/* spoof_kstat: explicit per-path/per-ino kstat overrides (api15)     */
+/* ------------------------------------------------------------------ */
+struct hymo_spoof_kstat_entry {
+	char *target_pathname;             /* may be NULL when only ino-keyed */
+	u32 path_hash;
+	unsigned long target_ino;          /* 0 = unresolved, look up by path only */
+	unsigned long target_dev;          /* 0 = match any */
+
+	unsigned long spoofed_ino;
+	unsigned long spoofed_dev;
+	unsigned int  spoofed_nlink;
+	long long     spoofed_size;
+	long spoofed_atime_sec;
+	long spoofed_atime_nsec;
+	long spoofed_mtime_sec;
+	long spoofed_mtime_nsec;
+	long spoofed_ctime_sec;
+	long spoofed_ctime_nsec;
+	unsigned long      spoofed_blksize;
+	unsigned long long spoofed_blocks;
+	int is_static;
+
+	struct hlist_node path_node;
+	struct hlist_node ino_node;
+	struct rcu_head rcu;
+};
+
+static DEFINE_HASHTABLE(hymo_spoof_kstat_path, HYMO_HASH_BITS);
+static DEFINE_HASHTABLE(hymo_spoof_kstat_ino,  HYMO_HASH_BITS);
+static atomic_t hymo_spoof_kstat_count = ATOMIC_INIT(0);
+
 static DEFINE_MUTEX(hymo_config_mutex);
 
 /* Maps spoof rules (read buffer filter for /proc/pid/maps); used by ioctl and filter. */
@@ -243,13 +277,8 @@ static char hymo_mirror_name_buf[NAME_MAX] = HYMO_DEFAULT_MIRROR_NAME;
 static char *hymo_current_mirror_path = hymo_mirror_path_buf;
 static char *hymo_current_mirror_name = hymo_mirror_name_buf;
 
-/* uname spoofing: RCU-protected (wrapper has rcu_head, keeps ABI same as userspace) */
-struct hymo_uname_rcu {
-	struct hymo_spoof_uname data;
-	struct rcu_head rcu;
-};
-static struct hymo_uname_rcu __rcu *hymo_spoof_uname_ptr;
-static bool hymo_uname_spoof_active;
+/* uname spoofing now lives in hymofs_uname.{c,h} — direct utsname memory writes,
+ * no per-syscall hooks. See there for global and scoped (per-task uts_ns) modes. */
 
 /* cmdline spoofing: RCU-protected (wrapper has rcu_head for kfree_rcu) */
 struct hymo_cmdline_rcu {
@@ -262,7 +291,6 @@ static bool hymo_cmdline_spoof_active;
 static pid_t hymo_daemon_pid;
 
 /* Kprobe registration flags (used by GET_FEATURES before their definitions) */
-static int hymo_uname_kprobe_registered;
 static int hymo_cmdline_kprobe_registered;
 static int hymo_cmdline_kretprobe_registered;
 static int hymo_getxattr_kprobe_registered;
@@ -363,6 +391,49 @@ static void hymo_merge_entry_free_rcu(struct rcu_head *head)
 	kfree(e);
 }
 
+static void hymo_spoof_kstat_entry_free_rcu(struct rcu_head *head)
+{
+	struct hymo_spoof_kstat_entry *e =
+		container_of(head, struct hymo_spoof_kstat_entry, rcu);
+	kfree(e->target_pathname);
+	kfree(e);
+}
+
+/* RCU-safe lookups. Caller must hold rcu_read_lock(). */
+static struct hymo_spoof_kstat_entry *
+hymofs_spoof_kstat_lookup_by_path(const char *path_str)
+{
+	struct hymo_spoof_kstat_entry *e;
+	u32 hash;
+
+	if (!path_str || !*path_str)
+		return NULL;
+	hash = full_name_hash(NULL, path_str, strlen(path_str));
+	hlist_for_each_entry_rcu(e,
+		&hymo_spoof_kstat_path[hash_min(hash, HYMO_HASH_BITS)], path_node) {
+		if (e->path_hash == hash && e->target_pathname &&
+		    strcmp(e->target_pathname, path_str) == 0)
+			return e;
+	}
+	return NULL;
+}
+
+static struct hymo_spoof_kstat_entry *
+hymofs_spoof_kstat_lookup_by_ino(unsigned long ino, unsigned long dev)
+{
+	struct hymo_spoof_kstat_entry *e;
+
+	if (!ino)
+		return NULL;
+	hlist_for_each_entry_rcu(e,
+		&hymo_spoof_kstat_ino[hash_min(ino, HYMO_HASH_BITS)], ino_node) {
+		if (e->target_ino == ino &&
+		    (e->target_dev == 0 || dev == 0 || e->target_dev == dev))
+			return e;
+	}
+	return NULL;
+}
+
 /* ======================================================================
  * Part 7: Inode Marking
  * ====================================================================== */
@@ -448,6 +519,22 @@ static void hymo_cleanup_locked(void)
 	hash_for_each_safe(hymo_merge_dirs, bkt, tmp, merge_entry, node) {
 		hlist_del_rcu(&merge_entry->node);
 		call_rcu(&merge_entry->rcu, hymo_merge_entry_free_rcu);
+	}
+	{
+		struct hymo_spoof_kstat_entry *sk_entry;
+
+		hash_for_each_safe(hymo_spoof_kstat_path, bkt, tmp, sk_entry, path_node) {
+			hlist_del_rcu(&sk_entry->path_node);
+			if (sk_entry->target_ino)
+				hlist_del_rcu(&sk_entry->ino_node);
+			call_rcu(&sk_entry->rcu, hymo_spoof_kstat_entry_free_rcu);
+		}
+		/* Sweep ino-only entries (no path). */
+		hash_for_each_safe(hymo_spoof_kstat_ino, bkt, tmp, sk_entry, ino_node) {
+			hlist_del_rcu(&sk_entry->ino_node);
+			call_rcu(&sk_entry->rcu, hymo_spoof_kstat_entry_free_rcu);
+		}
+		atomic_set(&hymo_spoof_kstat_count, 0);
 	}
 
 	bitmap_zero(hymo_path_bloom, HYMO_BLOOM_SIZE);
@@ -1006,7 +1093,7 @@ static bool hymo_uid_in_allowlist(uid_t uid)
 	return p != NULL;
 }
 
-static bool hymo_should_apply_hide_rules(void)
+bool hymo_should_apply_hide_rules(void)
 {
 	uid_t uid = __kuid_val(current_uid());
 
@@ -1523,25 +1610,27 @@ static int hymo_dispatch_cmd(unsigned int cmd, void __user *arg)
 	}
 
 	if (cmd == HYMO_IOC_SET_UNAME) {
+		/* Scoped mode: stored config is applied per-task on first syscall
+		 * from a hidden-uid process by unsharing CLONE_NEWUTS and writing
+		 * the fake fields into the task's private uts_ns. */
 		struct hymo_spoof_uname u;
-		struct hymo_uname_rcu *new_u, *old_u;
 
 		if (copy_from_user(&u, arg, sizeof(u)))
 			return -EFAULT;
-		new_u = kmalloc(sizeof(*new_u), GFP_KERNEL);
-		if (!new_u)
-			return -ENOMEM;
-		memcpy(&new_u->data, &u, sizeof(u));
-		mutex_lock(&hymo_config_mutex);
-		old_u = rcu_dereference_protected(hymo_spoof_uname_ptr,
-						  lockdep_is_held(&hymo_config_mutex));
-		rcu_assign_pointer(hymo_spoof_uname_ptr, new_u);
-		mutex_unlock(&hymo_config_mutex);
-		if (old_u)
-			kfree_rcu(old_u, rcu);
-		hymo_uname_spoof_active = (u.sysname[0] || u.nodename[0] || u.release[0] ||
-					   u.version[0] || u.machine[0] || u.domainname[0]);
-		return 0;
+		return hymofs_uname_set_scoped_config(&u);
+	}
+
+	if (cmd == HYMO_IOC_SET_UNAME_GLOBAL) {
+		/* Global mode: rewrite init_uts_ns in place. All-empty struct
+		 * restores originals. */
+		struct hymo_spoof_uname u;
+
+		if (copy_from_user(&u, arg, sizeof(u)))
+			return -EFAULT;
+		if (u.sysname[0] || u.nodename[0] || u.release[0] ||
+		    u.version[0] || u.machine[0] || u.domainname[0])
+			return hymofs_uname_apply_global(&u);
+		return hymofs_uname_restore_global();
 	}
 
 	if (cmd == HYMO_IOC_SET_CMDLINE) {
@@ -1571,6 +1660,165 @@ static int hymo_dispatch_cmd(unsigned int cmd, void __user *arg)
 		kfree(c);
 		if (hymo_cmdline_spoof_active)
 			hymo_log("cmdline: spoofed\n");
+		return 0;
+	}
+
+	if (cmd == HYMO_IOC_ADD_SPOOF_KSTAT || cmd == HYMO_IOC_UPDATE_SPOOF_KSTAT) {
+		struct hymo_spoof_kstat __user *u = (struct hymo_spoof_kstat __user *)arg;
+		struct hymo_spoof_kstat *k;
+		struct hymo_spoof_kstat_entry *e, *existing = NULL;
+		size_t plen;
+		u32 phash = 0;
+		bool have_path;
+		struct path resolved;
+		unsigned long auto_ino = 0;
+
+		k = kmalloc(sizeof(*k), GFP_KERNEL);
+		if (!k)
+			return -ENOMEM;
+		if (copy_from_user(k, u, sizeof(*k))) {
+			kfree(k);
+			return -EFAULT;
+		}
+		k->target_pathname[HYMO_MAX_LEN_PATHNAME - 1] = '\0';
+		have_path = (k->target_pathname[0] != '\0');
+
+		/* Auto-resolve target_ino from path if userspace did not supply one. */
+		if (have_path && k->target_ino == 0 && hymo_kern_path) {
+			if (hymo_kern_path(k->target_pathname, LOOKUP_FOLLOW, &resolved) == 0) {
+				if (resolved.dentry && d_inode(resolved.dentry))
+					auto_ino = (unsigned long)d_inode(resolved.dentry)->i_ino;
+				path_put(&resolved);
+			}
+			if (auto_ino)
+				k->target_ino = auto_ino;
+		}
+
+		if (!have_path && !k->target_ino) {
+			k->err = -EINVAL;
+			(void)copy_to_user(u, k, sizeof(*k));
+			kfree(k);
+			return -EINVAL;
+		}
+
+		if (have_path) {
+			plen = strlen(k->target_pathname);
+			phash = full_name_hash(NULL, k->target_pathname, plen);
+		}
+
+		mutex_lock(&hymo_config_mutex);
+
+		/* Look for existing entry by path, then by ino. */
+		if (have_path) {
+			hlist_for_each_entry(e,
+				&hymo_spoof_kstat_path[hash_min(phash, HYMO_HASH_BITS)], path_node) {
+				if (e->path_hash == phash && e->target_pathname &&
+				    strcmp(e->target_pathname, k->target_pathname) == 0) {
+					existing = e;
+					break;
+				}
+			}
+		}
+		if (!existing && k->target_ino) {
+			hlist_for_each_entry(e,
+				&hymo_spoof_kstat_ino[hash_min(k->target_ino, HYMO_HASH_BITS)],
+				ino_node) {
+				if (e->target_ino == k->target_ino &&
+				    e->target_dev == 0) {
+					existing = e;
+					break;
+				}
+			}
+		}
+
+		if (existing && cmd == HYMO_IOC_ADD_SPOOF_KSTAT) {
+			/* Idempotent ADD: treat as UPDATE. */
+		}
+
+		if (!existing) {
+			e = kzalloc(sizeof(*e), GFP_KERNEL);
+			if (!e) {
+				mutex_unlock(&hymo_config_mutex);
+				k->err = -ENOMEM;
+				(void)copy_to_user(u, k, sizeof(*k));
+				kfree(k);
+				return -ENOMEM;
+			}
+			if (have_path) {
+				e->target_pathname = kstrdup(k->target_pathname, GFP_KERNEL);
+				if (!e->target_pathname) {
+					kfree(e);
+					mutex_unlock(&hymo_config_mutex);
+					k->err = -ENOMEM;
+					(void)copy_to_user(u, k, sizeof(*k));
+					kfree(k);
+					return -ENOMEM;
+				}
+				e->path_hash = phash;
+			}
+			e->target_ino = k->target_ino;
+			e->target_dev = 0;
+			e->spoofed_ino     = k->spoofed_ino;
+			e->spoofed_dev     = k->spoofed_dev;
+			e->spoofed_nlink   = k->spoofed_nlink;
+			e->spoofed_size    = k->spoofed_size;
+			e->spoofed_atime_sec  = k->spoofed_atime_sec;
+			e->spoofed_atime_nsec = k->spoofed_atime_nsec;
+			e->spoofed_mtime_sec  = k->spoofed_mtime_sec;
+			e->spoofed_mtime_nsec = k->spoofed_mtime_nsec;
+			e->spoofed_ctime_sec  = k->spoofed_ctime_sec;
+			e->spoofed_ctime_nsec = k->spoofed_ctime_nsec;
+			e->spoofed_blksize = k->spoofed_blksize;
+			e->spoofed_blocks  = k->spoofed_blocks;
+			e->is_static       = k->is_static;
+
+			if (have_path)
+				hlist_add_head_rcu(&e->path_node,
+					&hymo_spoof_kstat_path[hash_min(phash, HYMO_HASH_BITS)]);
+			if (e->target_ino)
+				hlist_add_head_rcu(&e->ino_node,
+					&hymo_spoof_kstat_ino[hash_min(e->target_ino, HYMO_HASH_BITS)]);
+			atomic_inc(&hymo_spoof_kstat_count);
+			hymo_log("spoof_kstat: add path=%s ino=%lu->%lu\n",
+				 have_path ? k->target_pathname : "(none)",
+				 e->target_ino, e->spoofed_ino);
+		} else {
+			/* Update fields in place; readers may see torn values
+			 * briefly, acceptable for stat() spoof. */
+			existing->spoofed_ino     = k->spoofed_ino;
+			existing->spoofed_dev     = k->spoofed_dev;
+			existing->spoofed_nlink   = k->spoofed_nlink;
+			existing->spoofed_size    = k->spoofed_size;
+			existing->spoofed_atime_sec  = k->spoofed_atime_sec;
+			existing->spoofed_atime_nsec = k->spoofed_atime_nsec;
+			existing->spoofed_mtime_sec  = k->spoofed_mtime_sec;
+			existing->spoofed_mtime_nsec = k->spoofed_mtime_nsec;
+			existing->spoofed_ctime_sec  = k->spoofed_ctime_sec;
+			existing->spoofed_ctime_nsec = k->spoofed_ctime_nsec;
+			existing->spoofed_blksize = k->spoofed_blksize;
+			existing->spoofed_blocks  = k->spoofed_blocks;
+			existing->is_static       = k->is_static;
+
+			/* If newly-resolved ino became available, link into ino table. */
+			if (existing->target_ino == 0 && k->target_ino) {
+				existing->target_ino = k->target_ino;
+				hlist_add_head_rcu(&existing->ino_node,
+					&hymo_spoof_kstat_ino[hash_min(k->target_ino, HYMO_HASH_BITS)]);
+			}
+			hymo_log("spoof_kstat: update path=%s ino=%lu->%lu\n",
+				 have_path ? k->target_pathname : "(none)",
+				 existing->target_ino, existing->spoofed_ino);
+		}
+
+		hymofs_enabled = true;
+		mutex_unlock(&hymo_config_mutex);
+
+		k->err = 0;
+		if (copy_to_user(u, k, sizeof(*k))) {
+			kfree(k);
+			return -EFAULT;
+		}
+		kfree(k);
 		return 0;
 	}
 
@@ -1654,7 +1902,7 @@ static int hymo_dispatch_cmd(unsigned int cmd, void __user *arg)
 
 	if (cmd == HYMO_IOC_GET_FEATURES) {
 		int features = 0;
-		if (hymo_uname_kprobe_registered)
+		if (hymofs_uname_capable())
 			features |= HYMO_FEATURE_UNAME_SPOOF;
 		if (hymo_cmdline_kprobe_registered || hymo_cmdline_kretprobe_registered ||
 		    (hymofs_tracepoint_path_registered() && hymofs_tracepoint_getfd_registered()))
@@ -1725,9 +1973,17 @@ static int hymo_dispatch_cmd(unsigned int cmd, void __user *arg)
 		written += n;
 
 		/* uname */
-		n = scnprintf(kbuf + written, buf_size - written,
-			     "uname: %s\n", hymo_uname_kprobe_registered ? "kretprobe" : "none");
-		written += n;
+		{
+			const char *mode = "none";
+			bool g = hymofs_uname_global_active();
+			bool s = hymofs_uname_scoped_active();
+			if (g && s)       mode = "utsname (global+scoped)";
+			else if (g)        mode = "utsname (global)";
+			else if (s)        mode = "utsname (scoped/uts_ns)";
+			n = scnprintf(kbuf + written, buf_size - written,
+				     "uname: %s\n", mode);
+			written += n;
+		}
 
 		/* cmdline */
 		if (hymofs_tracepoint_path_registered() && hymofs_tracepoint_getfd_registered())
@@ -2275,12 +2531,15 @@ static HYMO_NOCFI long hymofs_dev_ioctl(struct file *file, unsigned int cmd,
 	case HYMO_IOC_SET_MIRROR_PATH:
 	case HYMO_IOC_GET_HOOKS:
 	case HYMO_IOC_SET_UNAME:
+	case HYMO_IOC_SET_UNAME_GLOBAL:
 	case HYMO_IOC_ADD_MAPS_RULE:
 	case HYMO_IOC_CLEAR_MAPS_RULES:
 	case HYMO_IOC_GET_FEATURES:
 	case HYMO_IOC_SET_MOUNT_HIDE:
 	case HYMO_IOC_SET_MAPS_SPOOF:
 	case HYMO_IOC_SET_STATFS_SPOOF:
+	case HYMO_IOC_ADD_SPOOF_KSTAT:
+	case HYMO_IOC_UPDATE_SPOOF_KSTAT:
 		ret = hymo_dispatch_cmd(cmd, (void __user *)arg);
 		break;
 	default:
@@ -2551,74 +2810,6 @@ static struct kprobe hymo_kp_prctl = {
 	.pre_handler = hymo_prctl_pre,
 };
 static int hymo_prctl_kprobe_registered;
-
-/* ======================================================================
- * uname spoofing: kretprobe on __arm64_sys_newuname / __x64_sys_newuname
- * On return, kernel has filled user buf; we overwrite with spoofed values.
- * ====================================================================== */
-
-static int hymo_uname_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	void __user *buf;
-#if defined(__aarch64__)
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 16, 0)
-	struct pt_regs *real_regs = (struct pt_regs *)regs->regs[0];
-	buf = (void __user *)real_regs->regs[0];
-#else
-	buf = (void __user *)regs->regs[0];
-#endif
-#elif defined(__x86_64__)
-	buf = (void __user *)regs->di;
-#else
-	buf = NULL;
-#endif
-	*(void __user **)ri->data = buf;
-	return 0;
-}
-
-static int hymo_uname_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	void __user *buf = *(void __user **)ri->data;
-	struct new_utsname kbuf;
-	struct hymo_spoof_uname spoof = {};
-	struct hymo_uname_rcu *spoof_ptr;
-	pid_t pid;
-
-	if (!buf || !READ_ONCE(hymo_uname_spoof_active))
-		return 0;
-	pid = task_tgid_vnr(current);
-	if (READ_ONCE(hymo_daemon_pid) > 0 && pid == READ_ONCE(hymo_daemon_pid))
-		return 0;
-	if (copy_from_user(&kbuf, buf, sizeof(kbuf)))
-		return 0;
-	rcu_read_lock();
-	spoof_ptr = rcu_dereference(hymo_spoof_uname_ptr);
-	if (spoof_ptr)
-		spoof = spoof_ptr->data;
-	rcu_read_unlock();
-	if (spoof.sysname[0])
-		strscpy(kbuf.sysname, spoof.sysname, sizeof(kbuf.sysname));
-	if (spoof.nodename[0])
-		strscpy(kbuf.nodename, spoof.nodename, sizeof(kbuf.nodename));
-	if (spoof.release[0])
-		strscpy(kbuf.release, spoof.release, sizeof(kbuf.release));
-	if (spoof.version[0])
-		strscpy(kbuf.version, spoof.version, sizeof(kbuf.version));
-	if (spoof.machine[0])
-		strscpy(kbuf.machine, spoof.machine, sizeof(kbuf.machine));
-	if (spoof.domainname[0])
-		strscpy(kbuf.domainname, spoof.domainname, sizeof(kbuf.domainname));
-	if (copy_to_user(buf, &kbuf, sizeof(kbuf)))
-		; /* ignore */
-	return 0;
-}
-
-static struct kretprobe hymo_krp_uname = {
-	.entry_handler = hymo_uname_entry,
-	.handler = hymo_uname_ret,
-	.data_size = sizeof(void __user *),
-	.maxactive = 64,
-};
 
 /* ======================================================================
  * cmdline spoofing: kprobe pre_handler on cmdline_proc_show
@@ -3391,20 +3582,22 @@ passthrough:
 #endif
 
 /*
- * vfs_getattr / vfs_getxattr argument positions across kernel versions.
- * <5.12:  vfs_getattr(path, kstat, mask, flags)
- * >=5.12: vfs_getattr(userns/idmap, path, kstat, mask, flags)
+ * vfs_getattr / vfs_getxattr argument positions.
+ *
+ * Upstream Linux added an idmap arg to vfs_getattr in 5.12, but Android GKI
+ * kernels (verified across 5.10/5.15/6.1/6.6/6.12) keep the original 4-arg
+ * signature `vfs_getattr(path, stat, mask, flags)`. So the upstream version
+ * gate was wrong for every Android target — always shifted args by one and
+ * silently early-exited on `!p->dentry`. Hardcode the 4-arg layout instead.
  */
+#define HYMO_GETATTR_PATH_REG(regs) HYMO_REG0(regs)
+#define HYMO_GETATTR_STAT_REG(regs) HYMO_REG1(regs)
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0))
-#define HYMO_GETATTR_PATH_REG(regs) HYMO_REG1(regs)
-#define HYMO_GETATTR_STAT_REG(regs) HYMO_REG2(regs)
 #define HYMO_GETXATTR_DENTRY_REG(regs) HYMO_REG1(regs)
 #define HYMO_GETXATTR_NAME_REG(regs)   HYMO_REG2(regs)
 #define HYMO_GETXATTR_VALUE_REG(regs)  HYMO_REG3(regs)
 #define HYMO_GETXATTR_SIZE_REG(regs)   HYMO_REG4(regs)
 #else
-#define HYMO_GETATTR_PATH_REG(regs) HYMO_REG0(regs)
-#define HYMO_GETATTR_STAT_REG(regs) HYMO_REG1(regs)
 #define HYMO_GETXATTR_DENTRY_REG(regs) HYMO_REG0(regs)
 #define HYMO_GETXATTR_NAME_REG(regs)   HYMO_REG1(regs)
 #define HYMO_GETXATTR_VALUE_REG(regs)  HYMO_REG2(regs)
@@ -3810,7 +4003,8 @@ HYMO_NOCFI int hymo_krp_vfs_getattr_entry(struct kretprobe_instance *ri,
 		return 0;
 	if (hymo_this_cpu()->in_populate_inject)
 		return 0;
-	if (atomic_read(&hymo_rule_count) == 0)
+	if (atomic_read(&hymo_rule_count) == 0 &&
+	    atomic_read(&hymo_spoof_kstat_count) == 0)
 		return 0;
 
 	p = (const struct path *)HYMO_GETATTR_PATH_REG(regs);
@@ -3824,6 +4018,10 @@ HYMO_NOCFI int hymo_krp_vfs_getattr_entry(struct kretprobe_instance *ri,
 
 	/* Fast path: inode already marked from a previous redirect match */
 	if (d->mapping && test_bit(AS_FLAGS_HYMO_SPOOF_KSTAT, &d->mapping->flags)) {
+		/* If shadow i_op is installed, it will spoof inline — skip the
+		 * ret handler entirely to avoid redundant work. */
+		if (test_bit(AS_FLAGS_HYMO_IOP_INSTALLED, &d->mapping->flags))
+			return -1;
 		d->is_target = true;
 		return 0;
 	}
@@ -3837,8 +4035,16 @@ HYMO_NOCFI int hymo_krp_vfs_getattr_entry(struct kretprobe_instance *ri,
 		return 0;
 
 	rcu_read_lock();
-	if (hymofs_reverse_lookup_target(dp))
+	if (hymofs_reverse_lookup_target(dp) ||
+	    hymofs_spoof_kstat_lookup_by_path(dp))
 		d->is_target = true;
+	if (!d->is_target && d_inode(p->dentry)) {
+		struct inode *ino = d_inode(p->dentry);
+		if (hymofs_spoof_kstat_lookup_by_ino(
+			(unsigned long)ino->i_ino,
+			ino->i_sb ? (unsigned long)ino->i_sb->s_dev : 0))
+			d->is_target = true;
+	}
 	rcu_read_unlock();
 
 	return 0;
@@ -3848,11 +4054,72 @@ HYMO_NOCFI int hymo_krp_vfs_getattr_entry(struct kretprobe_instance *ri,
  * vfs_getattr kretprobe ret: spoof kstat for redirect targets.
  * Makes the file appear to belong to /system with root ownership.
  */
+/*
+ * Apply kstat spoofing in place. Shared by:
+ *   - vfs_getattr kretprobe ret handler (legacy slow path)
+ *   - hymo_shadow_getattr in hymofs_iop_override.c (fast path after install)
+ *
+ * Note: `inode` may be NULL for the legacy path (we still have stat / mapping
+ * via the kretprobe ri data); the shadow path always provides it.
+ */
+void hymo_apply_kstat_spoof(struct inode *inode, struct kstat *stat)
+{
+	struct hymo_spoof_kstat_entry *e = NULL;
+
+	if (!stat)
+		return;
+
+	/* Explicit per-inode spoof rule (api15) takes precedence. */
+	if (inode && atomic_read(&hymo_spoof_kstat_count) > 0) {
+		rcu_read_lock();
+		e = hymofs_spoof_kstat_lookup_by_ino((unsigned long)inode->i_ino,
+						     (unsigned long)stat->dev);
+		if (e) {
+			if (e->spoofed_dev)        stat->dev = e->spoofed_dev;
+			if (e->spoofed_ino)        stat->ino = e->spoofed_ino;
+			if (e->spoofed_nlink)      stat->nlink = e->spoofed_nlink;
+			if (e->spoofed_size)       stat->size = e->spoofed_size;
+			if (e->spoofed_blksize)    stat->blksize = e->spoofed_blksize;
+			if (e->spoofed_blocks)     stat->blocks = e->spoofed_blocks;
+			if (e->spoofed_atime_sec || e->spoofed_atime_nsec) {
+				stat->atime.tv_sec  = e->spoofed_atime_sec;
+				stat->atime.tv_nsec = e->spoofed_atime_nsec;
+			}
+			if (e->spoofed_mtime_sec || e->spoofed_mtime_nsec) {
+				stat->mtime.tv_sec  = e->spoofed_mtime_sec;
+				stat->mtime.tv_nsec = e->spoofed_mtime_nsec;
+			}
+			if (e->spoofed_ctime_sec || e->spoofed_ctime_nsec) {
+				stat->ctime.tv_sec  = e->spoofed_ctime_sec;
+				stat->ctime.tv_nsec = e->spoofed_ctime_nsec;
+			}
+		}
+		rcu_read_unlock();
+	}
+
+	if (!e) {
+		/* Generic fallback: piggyback on add_rule redirect targets. */
+		if (hymo_system_dev)
+			stat->dev = hymo_system_dev;
+		stat->ino = (u64)jhash(stat, sizeof(stat->ino), 0x48594D4F) | 0x100000ULL;
+		if (S_ISREG(stat->mode))
+			stat->nlink = 1;
+	}
+
+	stat->uid = GLOBAL_ROOT_UID;
+	stat->gid = GLOBAL_ROOT_GID;
+
+	hymo_log("kstat: spoofed ino %lu (explicit=%d)\n",
+		 (unsigned long)stat->ino, e ? 1 : 0);
+
+	if (inode && inode->i_mapping)
+		set_bit(AS_FLAGS_HYMO_SPOOF_KSTAT, &inode->i_mapping->flags);
+}
+
 int hymo_krp_vfs_getattr_ret(struct kretprobe_instance *ri,
 				    struct pt_regs *regs)
 {
 	struct hymo_getattr_ri_data *d = (void *)ri->data;
-	struct kstat *stat;
 	int ret_val;
 
 	if (!d->is_target || !d->stat)
@@ -3868,20 +4135,18 @@ int hymo_krp_vfs_getattr_ret(struct kretprobe_instance *ri,
 	if (ret_val != 0)
 		return 0;
 
-	stat = d->stat;
-	if (hymo_system_dev)
-		stat->dev = hymo_system_dev;
-	stat->uid = GLOBAL_ROOT_UID;
-	stat->gid = GLOBAL_ROOT_GID;
-	stat->ino = (u64)jhash(stat, sizeof(stat->ino), 0x48594D4F) | 0x100000ULL;
-	if (S_ISREG(stat->mode))
-		stat->nlink = 1;
-
-	hymo_log("kstat: spoofed ino %lu\n", (unsigned long)stat->ino);
-
-	/* Mark inode so xattr and future stat calls use fast O(1) check */
-	if (d->mapping)
-		set_bit(AS_FLAGS_HYMO_SPOOF_KSTAT, &d->mapping->flags);
+	{
+		struct inode *inode = d->mapping ? d->mapping->host : NULL;
+		hymo_apply_kstat_spoof(inode, d->stat);
+		/*
+		 * Lookup-time i_op install: after first successful spoof,
+		 * install a shadow inode_operations so future stat()s go
+		 * through an indirect call instead of trapping into this
+		 * kprobe. Safe to call repeatedly (idempotent).
+		 */
+		if (inode)
+			hymofs_iop_install(inode);
+	}
 
 	return 0;
 }
@@ -4625,36 +4890,10 @@ static int __init hymofs_lkm_init(void)
 		pr_alert("HymoFS: skipping extra kprobes (reboot,prctl,uname,cmdline)\n");
 	}
 
-	/* uname spoofing: kretprobe on newuname syscall */
-	if (!hymo_skip_extra_kprobes_param) {
-		static const char *uname_symbols[] = {
-#if defined(__aarch64__)
-			"__arm64_sys_newuname", "sys_newuname", "SyS_newuname", "uname", NULL
-#elif defined(__x86_64__)
-			"__x64_sys_newuname", "sys_newuname", "SyS_newuname", "uname", NULL
-#elif defined(__arm__)
-			"__arm_sys_newuname", "sys_newuname", "SyS_newuname", "uname", NULL
-#else
-			"sys_newuname", "SyS_newuname", "uname", NULL
-#endif
-		};
-		void *uname_addr = NULL;
-		int i, ret;
-
-		for (i = 0; uname_symbols[i]; i++) {
-			uname_addr = (void *)hymofs_lookup_name(uname_symbols[i]);
-			if (uname_addr)
-				break;
-		}
-		if (uname_addr) {
-			hymo_krp_uname.kp.addr = (kprobe_opcode_t *)uname_addr;
-			ret = register_kretprobe(&hymo_krp_uname);
-			if (ret == 0) {
-				pr_info("HymoFS: uname spoofing via kretprobe on %s\n", uname_symbols[i]);
-				hymo_uname_kprobe_registered = 1;
-			}
-		}
-	}
+	/* uname spoofing: direct utsname() memory writes, no kprobe. Resolve
+	 * symbols once here; ioctl handlers toggle global/scoped modes. */
+	if (hymofs_uname_init() != 0)
+		pr_warn("HymoFS: uname spoofing unavailable (init_uts_ns/uts_sem not resolvable)\n");
 
 	/* cmdline spoofing: tracepoint when available, else kretprobe on read, else kprobe on cmdline_proc_show */
 	if (!hymo_skip_extra_kprobes_param) {
@@ -5019,12 +5258,17 @@ static int __init hymofs_lkm_init(void)
 #else
 	pr_info("HymoFS: initialized (GET_FD only, VFS kprobes disabled)\n");
 #endif
+	/* lookup-time inode_operations override (best-effort; spoof still works
+	 * via the legacy kretprobe if this fails). */
+	(void)hymofs_iop_override_init();
 	return 0;
 }
 
 static void __exit hymofs_lkm_exit(void)
 {
 	pr_info("HymoFS: shutting down\n");
+
+	hymofs_iop_override_exit();
 
 	if (hymo_statfs_kretprobe_registered)
 		unregister_kretprobe(&hymo_krp_statfs);
@@ -5061,8 +5305,6 @@ static void __exit hymofs_lkm_exit(void)
 		unregister_kretprobe(&hymo_krp_cmdline_read);
 	if (hymo_cmdline_kprobe_registered)
 		unregister_kprobe(&hymo_kp_cmdline);
-	if (hymo_uname_kprobe_registered)
-		unregister_kretprobe(&hymo_krp_uname);
 	if (hymo_prctl_kprobe_registered)
 		unregister_kprobe(&hymo_kp_prctl);
 	if (hymo_reboot_kprobe_registered) {
@@ -5101,23 +5343,23 @@ static void __exit hymofs_lkm_exit(void)
 	}
 #endif
 
+	/* Tear down uname spoof state (restores init_uts_ns if global was on,
+	 * frees scoped config). Per-task uts_ns copies already in use are
+	 * owned by their tasks; they'll be put() on exit normally. */
+	hymofs_uname_exit();
+
 	/* Clean up all rules and wait for RCU grace period */
 	{
-		struct hymo_uname_rcu *old_uname;
 		struct hymo_cmdline_rcu *old_cmdline;
 
 		mutex_lock(&hymo_config_mutex);
 		hymo_cleanup_locked();
-		old_uname = rcu_dereference_protected(hymo_spoof_uname_ptr,
-						      lockdep_is_held(&hymo_config_mutex));
-		rcu_assign_pointer(hymo_spoof_uname_ptr, NULL);
 		old_cmdline = rcu_dereference_protected(hymo_spoof_cmdline_ptr,
 							lockdep_is_held(&hymo_config_mutex));
 		rcu_assign_pointer(hymo_spoof_cmdline_ptr, NULL);
 		mutex_unlock(&hymo_config_mutex);
 
 		rcu_barrier();
-		kfree(old_uname);
 		kfree(old_cmdline);
 	}
 	if (hymo_filldir_cache)

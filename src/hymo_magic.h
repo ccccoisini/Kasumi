@@ -22,7 +22,7 @@
 
 #define HYMO_MAGIC1 0x48594D4F  // "HYMO"
 #define HYMO_MAGIC2 0x524F4F54  // "ROOT"
-#define HYMO_PROTOCOL_VERSION 14
+#define HYMO_PROTOCOL_VERSION 15
 
 #define HYMO_MAX_LEN_PATHNAME 256
 #define HYMO_FAKE_CMDLINE_SIZE 4096
@@ -44,6 +44,9 @@
 /* Marks a directory as having inject/merge rules (fast path for iterate_dir) */
 #define AS_FLAGS_HYMO_DIR_HAS_INJECT 43
 #define BIT_HYMO_DIR_HAS_INJECT BIT(43)
+/* Marks an inode as having shadow inode_operations installed (lookup-time i_op override) */
+#define AS_FLAGS_HYMO_IOP_INSTALLED 44
+#define BIT_HYMO_IOP_INSTALLED BIT(44)
 #endif // #ifdef __KERNEL__
 
 /* Syscall number: 142 = SYS_reboot on aarch64; we kprobe __arm64_sys_reboot (5.10 compatible). */
@@ -196,5 +199,12 @@ struct hymo_statfs_spoof_arg {
 #define HYMO_IOC_SET_MOUNT_HIDE     _IOW(HYMO_IOC_MAGIC, 25, struct hymo_mount_hide_arg)
 #define HYMO_IOC_SET_MAPS_SPOOF    _IOW(HYMO_IOC_MAGIC, 26, struct hymo_maps_spoof_arg)
 #define HYMO_IOC_SET_STATFS_SPOOF  _IOW(HYMO_IOC_MAGIC, 27, struct hymo_statfs_spoof_arg)
+/*
+ * Global uname spoof: rewrite init_uts_ns in place. Affects ALL tasks that
+ * share init_uts_ns (i.e. all of Android userspace by default). Blunt but
+ * covers every kernel path that reads utsname(). Pass all-empty struct to
+ * restore originals.
+ */
+#define HYMO_IOC_SET_UNAME_GLOBAL  _IOW(HYMO_IOC_MAGIC, 28, struct hymo_spoof_uname)
 
 #endif /* _LINUX_HYMO_MAGIC_H */

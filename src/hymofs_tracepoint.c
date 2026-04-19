@@ -15,6 +15,7 @@
 
 #include "hymofs_lkm.h"
 #include "hymofs_tracepoint.h"
+#include "hymofs_uname.h"
 
 static int tp_path_registered;
 static int tp_getfd_registered;
@@ -44,6 +45,16 @@ static void hymo_sys_enter_handler(void *data, struct pt_regs *regs, long id)
 	(void)data;
 	if (!regs || !current || current->pid == 0)
 		return;
+	/*
+	 * uname scoped apply: first relevant syscall from a hidden-uid task
+	 * triggers a one-shot CLONE_NEWUTS unshare. After that, the task's
+	 * private uts_ns carries the fake values — no further hook needed.
+	 * apply_scoped_current short-circuits when not active or already
+	 * applied, so this is near-zero cost on the fast path.
+	 */
+	if (hymofs_uname_scoped_active() && hymo_should_apply_hide_rules())
+		hymofs_uname_apply_scoped_current();
+
 	if (!hymo_syscall_id_relevant(id))
 		return;
 	hymofs_handle_sys_enter_getfd(regs, id);
