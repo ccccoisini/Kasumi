@@ -23,9 +23,11 @@
 #include <linux/nsproxy.h>
 #include <linux/utsname.h>
 #include <linux/fs_struct.h>
+#include <linux/init_task.h>
 #include <linux/rwsem.h>
 #include <linux/string.h>
 #include <linux/err.h>
+#include <linux/user_namespace.h>
 #include <linux/version.h>
 
 #include "hymofs_lkm.h"
@@ -36,12 +38,20 @@
  * ------------------------------------------------------------------ */
 static struct rw_semaphore *hymo_uts_sem;
 static struct uts_namespace *hymo_init_uts_ns_ptr;
+static struct nsproxy *(*hymo_create_new_namespaces_fn)(unsigned long,
+							struct task_struct *,
+							struct user_namespace *,
+							struct fs_struct *);
 static int (*hymo_unshare_nsproxy_namespaces_fn)(unsigned long,
 						 struct nsproxy **,
 						 struct cred *,
 						 struct fs_struct *);
 static void (*hymo_switch_task_namespaces_fn)(struct task_struct *,
 					      struct nsproxy *);
+static const struct cred *(*hymo_override_creds_fn)(const struct cred *);
+static void (*hymo_revert_creds_fn)(const struct cred *);
+static struct task_struct *hymo_init_task_ptr;
+static struct cred *hymo_scoped_kcred;
 
 /* ------------------------------------------------------------------
  * Config state
@@ -95,6 +105,39 @@ static bool spoof_has_any(const struct hymo_spoof_uname *u)
 	       field_set(u->machine) || field_set(u->domainname);
 }
 
+static const char *hymo_errno_name(int err)
+{
+	switch (err) {
+	case 0:
+		return "OK";
+	case -EPERM:
+		return "EPERM";
+	case -EINVAL:
+		return "EINVAL";
+	case -ENOMEM:
+		return "ENOMEM";
+	case -ENOSPC:
+		return "ENOSPC";
+	case -EUSERS:
+		return "EUSERS";
+	default:
+		return "UNKNOWN";
+	}
+}
+
+/*
+ * kCFI rejects indirect calls through dynamically resolved pointers unless the
+ * callsite is explicitly exempted. Keep the exemption narrowly scoped to this
+ * wrapper so the rest of the uname path still benefits from normal checking.
+ */
+static HYMO_NOCFI struct nsproxy *hymo_create_new_uts_ns_nocfi(struct task_struct *task)
+{
+	if (!hymo_create_new_namespaces_fn || !task || !task->fs)
+		return ERR_PTR(-ENOSYS);
+	return hymo_create_new_namespaces_fn(CLONE_NEWUTS, task,
+					     current_user_ns(), task->fs);
+}
+
 /* ------------------------------------------------------------------
  * Init / exit
  * ------------------------------------------------------------------ */
@@ -103,15 +146,25 @@ int hymofs_uname_init(void)
 {
 	hymo_uts_sem = (struct rw_semaphore *)hymofs_lookup_name("uts_sem");
 	hymo_init_uts_ns_ptr = (struct uts_namespace *)hymofs_lookup_name("init_uts_ns");
+	hymo_create_new_namespaces_fn = (void *)hymofs_lookup_name("create_new_namespaces");
 	hymo_unshare_nsproxy_namespaces_fn = (void *)hymofs_lookup_name("unshare_nsproxy_namespaces");
 	hymo_switch_task_namespaces_fn = (void *)hymofs_lookup_name("switch_task_namespaces");
+	hymo_override_creds_fn = (void *)hymofs_lookup_name("override_creds");
+	hymo_revert_creds_fn = (void *)hymofs_lookup_name("revert_creds");
+	hymo_init_task_ptr = (struct task_struct *)hymofs_lookup_name("init_task");
 
 	if (!hymo_uts_sem || !hymo_init_uts_ns_ptr) {
 		pr_warn("HymoFS: uname: uts_sem/init_uts_ns not resolvable — uname spoof disabled\n");
 		return -ENOENT;
 	}
-	if (!hymo_unshare_nsproxy_namespaces_fn || !hymo_switch_task_namespaces_fn) {
-		pr_info("HymoFS: uname: scoped mode unavailable (ns helpers missing), global mode only\n");
+	if (hymo_unshare_nsproxy_namespaces_fn && hymo_switch_task_namespaces_fn &&
+	    hymo_override_creds_fn && hymo_revert_creds_fn && hymo_init_task_ptr)
+		hymo_scoped_kcred = prepare_kernel_cred(hymo_init_task_ptr);
+	if ((!hymo_create_new_namespaces_fn &&
+	     (!hymo_unshare_nsproxy_namespaces_fn || !hymo_override_creds_fn ||
+	      !hymo_revert_creds_fn || !hymo_init_task_ptr || !hymo_scoped_kcred)) ||
+	    !hymo_switch_task_namespaces_fn) {
+		pr_info("HymoFS: uname: scoped mode unavailable (ns/cred helpers missing), global mode only\n");
 	}
 	return 0;
 }
@@ -133,6 +186,11 @@ void hymofs_uname_exit(void)
 	if (old) {
 		rcu_barrier();
 		kfree(old);
+	}
+
+	if (hymo_scoped_kcred) {
+		put_cred(hymo_scoped_kcred);
+		hymo_scoped_kcred = NULL;
 	}
 }
 
@@ -207,6 +265,16 @@ int hymofs_uname_set_scoped_config(const struct hymo_spoof_uname *u)
 	struct hymo_uname_cfg_rcu *old_cfg;
 	bool active = u && spoof_has_any(u);
 
+	if (active && !hymo_switch_task_namespaces_fn)
+		return -ENOSYS;
+	if (active && !hymo_create_new_namespaces_fn &&
+	    (!hymo_unshare_nsproxy_namespaces_fn ||
+	     !hymo_override_creds_fn ||
+	     !hymo_revert_creds_fn ||
+	     !hymo_init_task_ptr ||
+	     !hymo_scoped_kcred))
+		return -ENOSYS;
+
 	if (active) {
 		new_cfg = kzalloc(sizeof(*new_cfg), GFP_KERNEL);
 		if (!new_cfg)
@@ -240,11 +308,16 @@ void hymofs_uname_apply_scoped_current(void)
 	struct uts_namespace *cur_uts;
 	struct hymo_uname_cfg_rcu *cfg;
 	struct hymo_spoof_uname spoof;
+	const struct cred *old_cred;
 	int ret;
 
 	if (!READ_ONCE(hymo_uname_scoped_on))
 		return;
-	if (!hymo_unshare_nsproxy_namespaces_fn || !hymo_switch_task_namespaces_fn)
+	if (!hymo_switch_task_namespaces_fn)
+		return;
+	if (!hymo_create_new_namespaces_fn &&
+	    (!hymo_unshare_nsproxy_namespaces_fn || !hymo_override_creds_fn ||
+	     !hymo_revert_creds_fn || !hymo_init_task_ptr || !hymo_scoped_kcred))
 		return;
 	if (!task || (task->flags & PF_KTHREAD))
 		return;
@@ -275,16 +348,31 @@ void hymofs_uname_apply_scoped_current(void)
 	rcu_read_unlock();
 
 	/*
-	 * unshare_nsproxy_namespaces() allocates a fresh nsproxy whose uts_ns
-	 * is a copy of the caller's current one (via copy_utsname). It only
-	 * works for `current`, which is exactly our use-case.
+	 * This helper enforces CAP_SYS_ADMIN in the caller's current user_ns.
+	 * Normal apps fail that check, so scoped uname would silently never
+	 * activate. Temporarily adopt a kernel service cred while creating the
+	 * private UTS ns, then immediately revert.
 	 */
-	/* NULL new_cred falls back to current_user_ns() inside create_new_namespaces;
-	 * fs is unused for CLONE_NEWUTS-only but the signature demands a non-NULL ptr. */
-	ret = hymo_unshare_nsproxy_namespaces_fn(CLONE_NEWUTS, &new_nsp,
-						 NULL, task->fs);
-	if (ret || !new_nsp)
-		return;
+	if (hymo_create_new_namespaces_fn) {
+		new_nsp = hymo_create_new_uts_ns_nocfi(task);
+		if (IS_ERR(new_nsp)) {
+			ret = PTR_ERR(new_nsp);
+			hymo_log("uname scoped: nocfi create_new_namespaces(CLONE_NEWUTS) failed: %d (%s)\n",
+				 ret, hymo_errno_name(ret));
+			return;
+		}
+	} else {
+		old_cred = hymo_override_creds_fn(hymo_scoped_kcred);
+		ret = hymo_unshare_nsproxy_namespaces_fn(CLONE_NEWUTS, &new_nsp,
+							 hymo_scoped_kcred,
+							 task->fs);
+		hymo_revert_creds_fn(old_cred);
+		if (ret || !new_nsp) {
+			hymo_log("uname scoped: CLONE_NEWUTS unshare failed: %d (%s)\n",
+				 ret, hymo_errno_name(ret));
+			return;
+		}
+	}
 
 	down_write(hymo_uts_sem);
 	hymo_merge_uts(&new_nsp->uts_ns->name, &spoof);
