@@ -13,6 +13,7 @@ hymofs_lkm-objs := \
 	policy/hymofs_path_policy.o \
 	overlay/hymofs_overlay.o \
 	hooks/hymofs_proc_hooks.o \
+	hooks/hymofs_proc_read_hooks.o \
 	hooks/hymofs_vfs_hooks.o \
 	hooks/hymofs_tracepoint_hooks.o \
 	hooks/hymofs_ftrace_hooks.o \

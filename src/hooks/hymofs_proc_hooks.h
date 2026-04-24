@@ -14,6 +14,8 @@
 
 int hymofs_proc_hooks_init(bool skip_getfd, bool no_tracepoint, bool skip_extra_kprobes);
 void hymofs_proc_hooks_exit(void);
+void hymofs_proc_read_hooks_init(void);
+void hymofs_proc_read_hooks_exit(void);
 int hymo_mount_proxy_install_fd(int fd);
 bool hymo_path_is_proc_mount_view(const char *path);
 bool hymo_path_is_proc_mountinfo(const char *path);
