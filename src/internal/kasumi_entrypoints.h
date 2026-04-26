@@ -24,6 +24,8 @@ void kasumi_handle_sys_enter_path(struct pt_regs *regs, long id);
 void kasumi_handle_sys_exit_path(struct pt_regs *regs, long ret);
 void kasumi_handle_sys_enter_statx(struct pt_regs *regs, long id);
 void kasumi_handle_sys_exit_statx(struct pt_regs *regs, long ret);
+void kasumi_handle_sys_enter_statfs(struct pt_regs *regs, long id);
+void kasumi_handle_sys_exit_statfs(struct pt_regs *regs, long ret);
 void kasumi_handle_sys_enter_getfd(struct pt_regs *regs, long id);
 void kasumi_handle_sys_exit_getfd(struct pt_regs *regs, long ret);
 void kasumi_handle_sys_enter_cmdline(struct pt_regs *regs, long id);

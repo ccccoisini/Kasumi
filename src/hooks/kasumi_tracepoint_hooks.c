@@ -39,6 +39,9 @@ static inline bool kasumi_syscall_id_relevant(long id)
 #ifdef __NR_statx
 	       id == __NR_statx ||
 #endif
+#ifdef __NR_statfs
+	       id == __NR_statfs ||
+#endif
 	       id == __NR_reboot || id == __NR_prctl || id == __NR_read ||
 	       id == (long)kasumi_syscall_nr_param;
 }
@@ -63,6 +66,7 @@ static void kasumi_sys_enter_handler(void *data, struct pt_regs *regs, long id)
 	kasumi_handle_sys_enter_getfd(regs, id);
 	kasumi_handle_sys_enter_path(regs, id);
 	kasumi_handle_sys_enter_statx(regs, id);
+	kasumi_handle_sys_enter_statfs(regs, id);
 	kasumi_handle_sys_enter_cmdline(regs, id);
 }
 
@@ -76,6 +80,7 @@ static void kasumi_sys_exit_handler(void *data, struct pt_regs *regs, long ret)
 		return;
 	kasumi_handle_sys_exit_path(regs, ret);
 	kasumi_handle_sys_exit_statx(regs, ret);
+	kasumi_handle_sys_exit_statfs(regs, ret);
 	kasumi_handle_sys_exit_getfd(regs, ret);
 	kasumi_handle_sys_exit_cmdline(regs, ret);
 }

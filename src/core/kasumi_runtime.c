@@ -110,6 +110,7 @@ int kasumi_maps_seq_read_registered;
 int kasumi_proc_proxy_registered;
 int kasumi_feature_enabled_mask = 0xFFFFFFFF;
 int kasumi_statfs_kretprobe_registered;
+int kasumi_statfs_tracepoint_registered;
 int kasumi_ni_kprobe_registered;
 int kasumi_reboot_kprobe_registered;
 int kasumi_syscall_nr_param = 142;

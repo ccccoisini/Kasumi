@@ -577,7 +577,8 @@ static int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		    kasumi_mount_hide_pread_fallback_registered ||
 		    kasumi_maps_seq_read_registered)
 			features |= KSM_FEATURE_MAPS_SPOOF;
-		if (kasumi_statfs_kretprobe_registered)
+		if (kasumi_statfs_kretprobe_registered ||
+		    kasumi_statfs_tracepoint_registered)
 			features |= KSM_FEATURE_STATFS_SPOOF;
 		if (copy_to_user(arg, &features, sizeof(features)))
 			return -EFAULT;
@@ -713,7 +714,10 @@ static int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		else
 			n = scnprintf(kbuf + written, buf_size - written, "maps: none\n");
 		written += n;
-		if (kasumi_statfs_kretprobe_registered)
+		if (kasumi_statfs_tracepoint_registered)
+			n = scnprintf(kbuf + written, buf_size - written,
+				     "statfs: tracepoint (sys_enter/sys_exit f_type spoof for INCONSISTENT_MOUNT)\n");
+		else if (kasumi_statfs_kretprobe_registered)
 			n = scnprintf(kbuf + written, buf_size - written,
 				     "statfs: kretprobe (f_type spoof for INCONSISTENT_MOUNT)\n");
 		else

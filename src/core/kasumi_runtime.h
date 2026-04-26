@@ -68,6 +68,11 @@ struct kasumi_percpu {
 		char path[KSM_MAX_LEN_PATHNAME];
 		int active;
 	} statx_ctx;
+	struct {
+		void __user *buf;
+		unsigned long spoof_f_type;
+		int active;
+	} statfs_ctx;
 #endif
 	int mount_proxy_pending;
 };
@@ -126,6 +131,7 @@ extern int kasumi_maps_seq_read_registered;
 extern int kasumi_proc_proxy_registered;
 extern int kasumi_feature_enabled_mask;
 extern int kasumi_statfs_kretprobe_registered;
+extern int kasumi_statfs_tracepoint_registered;
 extern int kasumi_ni_kprobe_registered;
 extern int kasumi_reboot_kprobe_registered;
 extern int kasumi_syscall_nr_param;

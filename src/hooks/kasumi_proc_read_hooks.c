@@ -1134,12 +1134,123 @@ static struct kretprobe kasumi_krp_seq_read_maps = {
 
 /* statfs f_type spoof: make direct (statfs) match resolved (mountinfo) to avoid INCONSISTENT_MOUNT.
  * We resolve the real (lower) fs type at statfs entry via d_real_inode and pass it through in ret.
- * OVERLAYFS_SUPER_MAGIC from uapi/linux/magic.h so we use the running kernel's definition. */
+ * OVERLAYFS_SUPER_MAGIC from uapi/linux/magic.h so we use the running kernel's definition.
+ *
+ * Two routes share the same resolver:
+ *   - sys_enter/sys_exit tracepoint dispatcher (preferred when registered)
+ *   - kretprobe on __arm64_sys_statfs (legacy fallback)
+ */
 
 struct kasumi_statfs_ri_data {
 	void __user *buf;
 	unsigned long spoof_f_type; /* real (lower) s_magic; 0 = do not spoof */
 };
+
+static unsigned long kasumi_statfs_resolve_spoof_magic(const char *path)
+{
+	struct path p;
+	struct inode *real_ino;
+	unsigned long spoof = 0;
+
+	if (!path || !kasumi_kern_path)
+		return 0;
+	if (kasumi_kern_path(path, 0, &p) != 0)
+		return 0;
+	if ((unsigned long)p.dentry->d_sb->s_magic == OVERLAYFS_SUPER_MAGIC) {
+		real_ino = kasumi_d_real_inode_impl(p.dentry);
+		if (real_ino && real_ino->i_sb != p.dentry->d_sb)
+			spoof = (unsigned long)real_ino->i_sb->s_magic;
+		else
+			spoof = (unsigned long)EROFS_SUPER_MAGIC;
+	}
+	path_put(&p);
+	return spoof;
+}
+
+static void kasumi_statfs_apply_spoof(void __user *buf, unsigned long spoof_f_type)
+{
+	u64 f_type;
+
+	if (!buf || spoof_f_type == 0)
+		return;
+	if (copy_from_user(&f_type, buf, sizeof(f_type)))
+		return;
+	if ((f_type & 0xffffffffUL) == OVERLAYFS_SUPER_MAGIC) {
+		f_type = (f_type & 0xffffffff00000000UL) | (spoof_f_type & 0xffffffffUL);
+		/* best-effort spoof; ignore write failure */
+		if (copy_to_user(buf, &f_type, sizeof(f_type)))
+			(void)0;
+	}
+}
+
+void kasumi_handle_sys_enter_statfs(struct pt_regs *regs, long id)
+{
+#if defined(__aarch64__) || defined(__x86_64__)
+	struct kasumi_percpu *pcpu = kasumi_this_cpu();
+	const char __user *pathname_user;
+	void __user *buf;
+	char path_buf[KSM_MAX_LEN_PATHNAME];
+
+	pcpu->statfs_ctx.active = 0;
+#ifdef __NR_statfs
+	if (id != __NR_statfs)
+		return;
+#else
+	(void)id;
+	return;
+#endif
+	if (!(kasumi_feature_enabled_mask & KSM_FEATURE_STATFS_SPOOF))
+		return;
+#if defined(__aarch64__)
+	pathname_user = (const char __user *)(uintptr_t)regs->regs[0];
+	buf = (void __user *)(uintptr_t)regs->regs[1];
+#else
+	pathname_user = (const char __user *)(uintptr_t)regs->di;
+	buf = (void __user *)(uintptr_t)regs->si;
+#endif
+	if (!pathname_user || !buf)
+		return;
+	if (kasumi_strncpy_from_user_nofault) {
+		long n = kasumi_strncpy_from_user_nofault(path_buf, pathname_user,
+							  sizeof(path_buf) - 1);
+		if (n < 0)
+			return;
+		path_buf[n < (long)(sizeof(path_buf) - 1) ? n :
+			 (long)(sizeof(path_buf) - 1)] = '\0';
+	} else {
+		if (copy_from_user(path_buf, pathname_user, sizeof(path_buf) - 1))
+			return;
+		path_buf[sizeof(path_buf) - 1] = '\0';
+	}
+
+	pcpu->statfs_ctx.spoof_f_type = kasumi_statfs_resolve_spoof_magic(path_buf);
+	if (pcpu->statfs_ctx.spoof_f_type == 0)
+		return;
+	pcpu->statfs_ctx.buf = buf;
+	pcpu->statfs_ctx.active = 1;
+#else
+	(void)regs;
+	(void)id;
+#endif
+}
+
+void kasumi_handle_sys_exit_statfs(struct pt_regs *regs, long ret)
+{
+#if defined(__aarch64__) || defined(__x86_64__)
+	struct kasumi_percpu *pcpu = kasumi_this_cpu();
+
+	(void)regs;
+	if (!pcpu->statfs_ctx.active)
+		return;
+	pcpu->statfs_ctx.active = 0;
+	if (ret < 0)
+		return;
+	kasumi_statfs_apply_spoof(pcpu->statfs_ctx.buf, pcpu->statfs_ctx.spoof_f_type);
+#else
+	(void)regs;
+	(void)ret;
+#endif
+}
 
 static int kasumi_statfs_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
@@ -1157,28 +1268,17 @@ static int kasumi_statfs_entry(struct kretprobe_instance *ri, struct pt_regs *re
 #endif
 	d->spoof_f_type = 0;
 	if (!(kasumi_feature_enabled_mask & KSM_FEATURE_STATFS_SPOOF) ||
-	    !pathname || !kasumi_kern_path)
+	    !pathname)
 		return 0;
 	{
 		char path_buf[KSM_MAX_LEN_PATHNAME];
-		struct path p;
-		struct inode *real_ino;
 		unsigned int n;
 
 		n = copy_from_user(path_buf, pathname, sizeof(path_buf) - 1);
 		path_buf[sizeof(path_buf) - 1] = '\0';
 		if (n != 0)
 			return 0;
-		if (kasumi_kern_path(path_buf, 0, &p) != 0)
-			return 0;
-		if ((unsigned long)p.dentry->d_sb->s_magic == OVERLAYFS_SUPER_MAGIC) {
-			real_ino = kasumi_d_real_inode_impl(p.dentry);
-			if (real_ino && real_ino->i_sb != p.dentry->d_sb)
-				d->spoof_f_type = (unsigned long)real_ino->i_sb->s_magic;
-			else
-				d->spoof_f_type = (unsigned long)EROFS_SUPER_MAGIC;
-		}
-		path_put(&p);
+		d->spoof_f_type = kasumi_statfs_resolve_spoof_magic(path_buf);
 	}
 	return 0;
 }
@@ -1197,19 +1297,8 @@ static int kasumi_statfs_ret(struct kretprobe_instance *ri, struct pt_regs *regs
 		return 0;
 	{
 		struct kasumi_statfs_ri_data *d = (struct kasumi_statfs_ri_data *)ri->data;
-		void __user *buf = d->buf;
-		u64 f_type;
 
-		if (!buf || d->spoof_f_type == 0)
-			return 0;
-		if (copy_from_user(&f_type, buf, sizeof(f_type)))
-			return 0;
-		if ((f_type & 0xffffffffUL) == OVERLAYFS_SUPER_MAGIC) {
-			f_type = (f_type & 0xffffffff00000000UL) | (d->spoof_f_type & 0xffffffffUL);
-			/* best-effort spoof; ignore write failure (kretprobe cannot change syscall return) */
-			if (copy_to_user(buf, &f_type, sizeof(f_type)))
-				(void)0;
-		}
+		kasumi_statfs_apply_spoof(d->buf, d->spoof_f_type);
 	}
 	return 0;
 }
@@ -1359,37 +1448,45 @@ void kasumi_proc_read_hooks_init(void)
 		}
 	}
 
-	if (!kasumi_statfs_kretprobe_registered) {
-		static const char *statfs_syms[] = {
-#if defined(__aarch64__)
-			"__arm64_sys_statfs", "sys_statfs", "SyS_statfs", NULL
-#elif defined(__x86_64__)
-			"__x64_sys_statfs", "sys_statfs", "SyS_statfs", NULL
-#elif defined(__arm__)
-			"__arm_sys_statfs", "sys_statfs", "SyS_statfs", NULL
-#else
-			"sys_statfs", "SyS_statfs", NULL
-#endif
-		};
-		unsigned long statfs_addr = 0;
-		int j;
+	if (!kasumi_statfs_kretprobe_registered && !kasumi_statfs_tracepoint_registered) {
+		bool prefer_tracepoint = kasumi_tracepoint_path_registered() &&
+					 kasumi_tracepoint_getfd_registered();
 
-		for (j = 0; statfs_syms[j]; j++) {
-			statfs_addr = kasumi_lookup_name(statfs_syms[j]);
-			if (statfs_addr)
-				break;
-		}
-		if (statfs_addr) {
-			kasumi_krp_statfs.kp.addr = (kprobe_opcode_t *)statfs_addr;
-			if (register_kretprobe(&kasumi_krp_statfs) == 0) {
-				kasumi_statfs_kretprobe_registered = 1;
-				pr_info("Kasumi: statfs f_type spoof via kretprobe on %s (INCONSISTENT_MOUNT bypass)\n",
-					statfs_syms[j]);
-			} else {
-				pr_warn("Kasumi: statfs kretprobe register failed\n");
-			}
+		if (prefer_tracepoint) {
+			kasumi_statfs_tracepoint_registered = 1;
+			pr_info("Kasumi: statfs f_type spoof via sys_enter/sys_exit tracepoint, kretprobe kept as fallback\n");
 		} else {
-			pr_warn("Kasumi: statfs syscall not found, INCONSISTENT_MOUNT bypass disabled\n");
+			static const char *statfs_syms[] = {
+#if defined(__aarch64__)
+				"__arm64_sys_statfs", "sys_statfs", "SyS_statfs", NULL
+#elif defined(__x86_64__)
+				"__x64_sys_statfs", "sys_statfs", "SyS_statfs", NULL
+#elif defined(__arm__)
+				"__arm_sys_statfs", "sys_statfs", "SyS_statfs", NULL
+#else
+				"sys_statfs", "SyS_statfs", NULL
+#endif
+			};
+			unsigned long statfs_addr = 0;
+			int j;
+
+			for (j = 0; statfs_syms[j]; j++) {
+				statfs_addr = kasumi_lookup_name(statfs_syms[j]);
+				if (statfs_addr)
+					break;
+			}
+			if (statfs_addr) {
+				kasumi_krp_statfs.kp.addr = (kprobe_opcode_t *)statfs_addr;
+				if (register_kretprobe(&kasumi_krp_statfs) == 0) {
+					kasumi_statfs_kretprobe_registered = 1;
+					pr_info("Kasumi: statfs f_type spoof via kretprobe on %s (INCONSISTENT_MOUNT bypass)\n",
+						statfs_syms[j]);
+				} else {
+					pr_warn("Kasumi: statfs kretprobe register failed\n");
+				}
+			} else {
+				pr_warn("Kasumi: statfs syscall not found, INCONSISTENT_MOUNT bypass disabled\n");
+			}
 		}
 	}
 }
@@ -1408,6 +1505,7 @@ void kasumi_proc_read_hooks_exit(void)
 
 	if (kasumi_statfs_kretprobe_registered)
 		unregister_kretprobe(&kasumi_krp_statfs);
+	kasumi_statfs_tracepoint_registered = 0;
 	if (kasumi_mount_hide_vfs_read_registered)
 		unregister_kretprobe(&kasumi_krp_vfs_read_mount_filter);
 	if (kasumi_mount_hide_read_fallback_registered)
