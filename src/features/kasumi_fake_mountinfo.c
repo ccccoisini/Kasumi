@@ -71,6 +71,7 @@ static int (*ptr_filp_close)(struct file *, fl_owner_t);
 static ssize_t (*ptr_kernel_read)(struct file *, void *, size_t, loff_t *);
 static const struct cred *(*ptr_override_creds)(const struct cred *);
 static void (*ptr_revert_creds)(const struct cred *);
+static struct task_struct *(*ptr_find_task_by_vpid)(pid_t nr);
 static struct task_struct *fake_mi_init_task_ptr;
 static struct cred **fake_mi_ksu_cred_pp;
 static struct cred *fake_mi_kcred;
@@ -477,6 +478,17 @@ static int regenerate_cache_locked(void)
 
     if (fake_mi_ksu_cred_pp)
         override_cred = READ_ONCE(*fake_mi_ksu_cred_pp);
+    if (!override_cred && ptr_find_task_by_vpid) {
+        struct task_struct *init_tsk;
+        rcu_read_lock();
+        init_tsk = ptr_find_task_by_vpid(1);
+        if (init_tsk) {
+            const struct cred *init_cred = READ_ONCE(init_tsk->real_cred);
+            if (init_cred)
+                override_cred = init_cred;
+        }
+        rcu_read_unlock();
+    }
     if (!override_cred)
         override_cred = fake_mi_kcred;
     if (override_cred && ptr_override_creds && ptr_revert_creds)
@@ -805,6 +817,7 @@ int kasumi_fake_mi_init(void)
     ptr_kernel_read = (void *)kasumi_lookup_name("kernel_read");
     ptr_override_creds = (void *)kasumi_lookup_name("override_creds");
     ptr_revert_creds = (void *)kasumi_lookup_name("revert_creds");
+    ptr_find_task_by_vpid = (void *)kasumi_lookup_name("find_task_by_vpid");
     fake_mi_init_task_ptr = (struct task_struct *)kasumi_lookup_name("init_task");
     fake_mi_ksu_cred_pp = (struct cred **)kasumi_lookup_name("ksu_cred");
 
@@ -815,8 +828,9 @@ int kasumi_fake_mi_init(void)
     }
     if (ptr_override_creds && ptr_revert_creds && fake_mi_init_task_ptr)
         fake_mi_kcred = prepare_kernel_cred(fake_mi_init_task_ptr);
-    pr_info("Kasumi fake_mi: initialized (ksu_cred=%p fallback_kcred=%p)\n",
+    pr_info("Kasumi fake_mi: initialized (ksu=%p init_vpid=%p kcred=%p)\n",
             fake_mi_ksu_cred_pp ? READ_ONCE(*fake_mi_ksu_cred_pp) : NULL,
+            ptr_find_task_by_vpid,
             fake_mi_kcred);
     return 0;
 }
