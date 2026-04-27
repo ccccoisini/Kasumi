@@ -1146,7 +1146,7 @@ struct kasumi_statfs_ri_data {
 	unsigned long spoof_f_type; /* real (lower) s_magic; 0 = do not spoof */
 };
 
-static unsigned long kasumi_statfs_resolve_spoof_magic(const char *path)
+unsigned long kasumi_statfs_resolve_spoof_magic(const char *path)
 {
 	struct path p;
 	struct inode *real_ino;
@@ -1167,7 +1167,7 @@ static unsigned long kasumi_statfs_resolve_spoof_magic(const char *path)
 	return spoof;
 }
 
-static void kasumi_statfs_apply_spoof(void __user *buf, unsigned long spoof_f_type)
+void kasumi_statfs_apply_spoof(void __user *buf, unsigned long spoof_f_type)
 {
 	u64 f_type;
 

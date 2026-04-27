@@ -27,6 +27,7 @@
 #include "kasumi_iop_override.h"
 #include "kasumi_fop_override.h"
 #include "kasumi_fake_mountinfo.h"
+#include "kasumi_syscall_redirect.h"
 
 #ifndef KASUMI_VERSION
 #define KASUMI_VERSION "0.1.0-dev"
@@ -207,6 +208,8 @@ int kasumi_bootstrap_init(void)
 
 	kasumi_resolve_system_dev();
 
+	(void)kasumi_syscall_redirect_init();
+
 	ret = kasumi_proc_hooks_init(kasumi_skip_getfd_param, kasumi_no_tracepoint_param,
 				     kasumi_skip_extra_kprobes_param);
 	if (ret)
@@ -255,6 +258,7 @@ void kasumi_bootstrap_exit(void)
 	kasumi_sop_override_exit();
 	kasumi_vfs_hooks_exit(kasumi_skip_vfs_param);
 	kasumi_proc_hooks_exit();
+	kasumi_syscall_redirect_exit();
 	kasumi_uname_exit();
 
 	mutex_lock(&kasumi_config_mutex);

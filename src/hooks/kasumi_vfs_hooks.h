@@ -21,5 +21,6 @@ void kasumi_vfs_hooks_exit(bool skip_vfs);
 struct kasumi_filldir_wrapper *kasumi_iterate_prepare_wrapper(struct file *file,
 							      struct dir_context *orig_ctx);
 void kasumi_iterate_finish_wrapper(struct kasumi_filldir_wrapper *wrapper);
+char __user *kasumi_userspace_stack_buffer(const char *data, size_t len);
 
 #endif /* _KASUMI_VFS_HOOKS_H */

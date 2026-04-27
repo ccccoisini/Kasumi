@@ -16,6 +16,7 @@ kasumi_lkm-objs := \
 	hooks/kasumi_proc_read_hooks.o \
 	hooks/kasumi_vfs_hooks.o \
 	hooks/kasumi_tracepoint_hooks.o \
+	hooks/kasumi_syscall_redirect.o \
 	hooks/kasumi_ftrace_hooks.o \
 	features/kasumi_uname.o \
 	features/kasumi_sop_override.o \

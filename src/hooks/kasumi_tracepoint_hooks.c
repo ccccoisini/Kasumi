@@ -14,6 +14,7 @@
 
 #include "kasumi_entrypoints.h"
 #include "kasumi_path_policy.h"
+#include "kasumi_syscall_redirect.h"
 #include "kasumi_tracepoint_hooks.h"
 #include "kasumi_uname.h"
 
@@ -60,6 +61,14 @@ static void kasumi_sys_enter_handler(void *data, struct pt_regs *regs, long id)
 
 	if (!kasumi_syscall_id_relevant(id))
 		return;
+
+	/* Redirect hooked syscalls to dispatcher — runs in process context */
+	if (kasumi_syscall_dispatcher_nr >= 0 && kasumi_has_syscall_hook(id)) {
+		PT_REGS_ORIG_SYSCALL(regs) = id;
+		regs->syscallno = kasumi_syscall_dispatcher_nr;
+		return;
+	}
+
 	kasumi_handle_sys_enter_getfd(regs, id);
 	kasumi_handle_sys_enter_path(regs, id);
 	kasumi_handle_sys_enter_statx(regs, id);

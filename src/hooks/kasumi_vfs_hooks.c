@@ -253,7 +253,7 @@ passthrough:
 
 #define KASUMI_HIDE_PATH "/.kasumi_hidden_placeholder"
 
-static char __user *kasumi_userspace_stack_buffer(const char *data, size_t len)
+char __user *kasumi_userspace_stack_buffer(const char *data, size_t len)
 {
 	char __user *p;
 
