@@ -107,8 +107,7 @@ Main ioctls (see `src/include/kasumi_uapi.h` for full ABI):
 - `KSM_IOC_ADD_MAPS_RULE`, `KSM_IOC_CLEAR_MAPS_RULES`
 - `KSM_IOC_SET_MOUNT_HIDE`, `KSM_IOC_SET_MAPS_SPOOF`, `KSM_IOC_SET_STATFS_SPOOF`
 
-For userspace integration, you can reuse [kasumi](https://github.com/Anatdx/kasumi) (C++) to reduce ABI mismatch risk.
-You can also use [YukiSU](https://github.com/Anatdx/YukiSU) (C++) for KernelSU-integrated flows.
+You can use [YukiSU](https://github.com/Anatdx/YukiSU) (C++) for KernelSU-integrated flows.
 In addition, the [hybrid-mount](https://github.com/Hybrid-Mount/meta-hybrid_mount) meta-module includes Kasumi support with a Rust userspace implementation.
 
 > Given mount logic quality and update cadence, hybrid-mount is generally the preferred meta-module choice.
