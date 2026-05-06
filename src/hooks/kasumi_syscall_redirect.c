@@ -338,7 +338,7 @@ static long do_openat(const struct pt_regs *regs, kasumi_syscall_hook_fn orig)
 	char *t;
 	char *target_path = NULL;
 	long ret;
-	bool proxy = false;
+	bool raw_proc_proxy = false;
 	long tgid = (long)task_tgid_vnr(current);
 
 	if (atomic_long_read(&kasumi_ioctl_tgid) == tgid ||
@@ -349,7 +349,7 @@ static long do_openat(const struct pt_regs *regs, kasumi_syscall_hook_fn orig)
 	path[sizeof(path) - 1] = '\0';
 
 	if (path[0] == '/' && kasumi_path_needs_proc_proxy(path)) {
-		proxy = true;
+		raw_proc_proxy = true;
 		if (kasumi_path_is_proc_mountinfo(path) &&
 		    kasumi_should_apply_hide_rules())
 			kasumi_fake_mi_prepare(false);
@@ -378,9 +378,9 @@ static long do_openat(const struct pt_regs *regs, kasumi_syscall_hook_fn orig)
 	}
 
 	ret = orig(regs);
-	if (!proxy && ret >= 0 && target_path)
+	if (!raw_proc_proxy && ret >= 0 && target_path)
 		(void)kasumi_file_view_bind_fd((int)ret, path, target_path);
-	if (proxy && ret >= 0)
+	if (ret >= 0 && kasumi_proc_proxy_should_try())
 		kasumi_mount_proxy_install_fd((int)ret);
 	kfree(target_path);
 	return ret;

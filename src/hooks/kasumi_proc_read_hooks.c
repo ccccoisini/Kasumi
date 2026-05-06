@@ -174,6 +174,16 @@ bool kasumi_path_needs_proc_proxy(const char *path)
 	return kasumi_proc_proxy_kind_for_path(path) != KASUMI_PROC_PROXY_NONE;
 }
 
+bool kasumi_proc_proxy_should_try(void)
+{
+	if (!READ_ONCE(kasumi_proc_proxy_registered))
+		return false;
+	if (!kasumi_root_allows_spoofing() || !kasumi_should_apply_hide_rules())
+		return false;
+	return (kasumi_feature_enabled_mask &
+		(KSM_FEATURE_MOUNT_HIDE | KSM_FEATURE_MAPS_SPOOF)) != 0;
+}
+
 /*
  * Revocable proxy lifecycle:
  *   - .owner = NULL so fops_get/fops_put never bump THIS_MODULE refcount; long-lived
@@ -406,6 +416,8 @@ int kasumi_mount_proxy_install_fd(int fd)
 		free_page((unsigned long)path_buf);
 		goto out;
 	}
+	if (kind == KASUMI_PROC_PROXY_MOUNTINFO)
+		(void)kasumi_fake_mi_prepare(false);
 	free_page((unsigned long)path_buf);
 
 	proxy = kzalloc(sizeof(*proxy), GFP_KERNEL);
