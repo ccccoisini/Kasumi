@@ -181,7 +181,7 @@ static int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 			written += scnprintf(kbuf + written, buf_size - written,
 					     "hide_xattr_sb %p\n", sb_entry->sb);
 		}
-		/* Feature rules: mount_hide, maps_spoof, statfs_spoof, fake_selinuxfs, stealth */
+		/* Feature rules: mount_hide, maps_spoof, statfs_spoof, selinux_fix, stealth */
 		if (kasumi_feature_enabled_mask & KSM_FEATURE_MOUNT_HIDE) {
 			if (written < buf_size)
 				written += scnprintf(kbuf + written, buf_size - written,
@@ -197,10 +197,10 @@ static int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 				written += scnprintf(kbuf + written, buf_size - written,
 						     "statfs_spoof enabled\n");
 		}
-		if (kasumi_feature_enabled_mask & KSM_FEATURE_FAKE_SELINUXFS) {
+		if (kasumi_feature_enabled_mask & KSM_FEATURE_SELINUX_FIX) {
 			if (written < buf_size)
 				written += scnprintf(kbuf + written, buf_size - written,
-						     "fake_selinuxfs enabled\n");
+						     "selinux_fix enabled\n");
 		}
 		if (kasumi_stealth_enabled) {
 			if (written < buf_size)
@@ -561,6 +561,18 @@ static int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		return 0;
 	}
 
+	if (cmd == KSM_IOC_SELINUX_FIX) {
+		int enable;
+
+		if (copy_from_user(&enable, arg, sizeof(enable)))
+			return -EFAULT;
+		if (enable)
+			kasumi_feature_enabled_mask |= KSM_FEATURE_SELINUX_FIX;
+		else
+			kasumi_feature_enabled_mask &= ~KSM_FEATURE_SELINUX_FIX;
+		return 0;
+	}
+
 	if (cmd == KSM_IOC_GET_FEATURES) {
 		int features = 0;
 		if (kasumi_uname_capable())
@@ -588,7 +600,7 @@ static int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		    kasumi_statfs_tracepoint_registered)
 			features |= KSM_FEATURE_STATFS_SPOOF;
 		if (kasumi_fake_selinuxfs_access_active())
-			features |= KSM_FEATURE_FAKE_SELINUXFS;
+			features |= KSM_FEATURE_SELINUX_FIX;
 		if (copy_to_user(arg, &features, sizeof(features)))
 			return -EFAULT;
 		return 0;
@@ -1276,6 +1288,7 @@ static KASUMI_NOCFI long kasumi_dev_ioctl(struct file *file, unsigned int cmd,
 	case KSM_IOC_SET_MOUNT_HIDE:
 	case KSM_IOC_SET_MAPS_SPOOF:
 	case KSM_IOC_SET_STATFS_SPOOF:
+	case KSM_IOC_SELINUX_FIX:
 	case KSM_IOC_ADD_SPOOF_KSTAT:
 	case KSM_IOC_UPDATE_SPOOF_KSTAT:
 		ret = kasumi_dispatch_cmd(cmd, (void __user *)arg);

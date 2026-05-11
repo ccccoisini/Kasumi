@@ -371,7 +371,7 @@ static long h_write(const struct pt_regs *regs)
 	char context[KASUMI_SELINUX_CTX_MAX];
 	size_t len;
 
-	if (!(kasumi_feature_enabled_mask & KSM_FEATURE_FAKE_SELINUXFS) ||
+	if (!(kasumi_feature_enabled_mask & KSM_FEATURE_SELINUX_FIX) ||
 	    !kasumi_should_apply_hide_rules())
 		return orig_kernel_write(regs);
 
